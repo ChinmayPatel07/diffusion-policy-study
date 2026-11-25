@@ -1,0 +1,143 @@
+# Beyonder urgent alerts — plain GitHub Actions, no Claude, no tokens.
+# Opens an "urgent" issue assigned to the repo owner (GitHub mobile notification) on:
+#   - a force-push to the default branch
+#   - a likely secret in pushed commits (any branch; the secret itself is never printed)
+#   - a failed CI run on the default branch
+# Canonical copy lives in the Beyonder home repo (workflows/beyonder-urgent.yml).
+name: Beyonder urgent alerts
+
+on:
+  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: beyonder-urgent-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+env:
+  GITLEAKS_VERSION: 8.21.2
+
+jobs:
+  force-push:
+    if: github.event_name == 'push' && github.event.forced && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open urgent issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSIGNEE: ${{ github.repository_owner }}
+          BRANCH: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          PUSHER: ${{ github.event.pusher.name }}
+          COMPARE: ${{ github.event.compare }}
+        run: |
+          gh label create urgent --color B60205 --description "Beyonder urgent alert" 2>/dev/null || true
+          title="🔴 Force-push to ${BRANCH}"
+          body=$(printf '%s\n' \
+            "**Force-push to \`${BRANCH}\`** by \`${PUSHER}\`." "" \
+            "- before: \`${BEFORE}\` (may now be unreachable)" \
+            "- after: \`${AFTER}\`" \
+            "- compare: ${COMPARE}" "" \
+            "To restore, check whether \`${BEFORE}\` held work that is now gone." "" \
+            "— Beyonder urgent alert (GitHub Actions, no AI)")
+          existing=$(gh issue list --label urgent --state open --search "in:title \"${title}\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then gh issue comment "$existing" --body "$body"
+          else gh issue create --title "$title" --label urgent --assignee "$ASSIGNEE" --body "$body"; fi
+
+  secrets:
+    if: github.event_name == 'push' && !github.event.deleted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (checksum verified)
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tgz="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/$tgz"
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${tgz}\$" | sha256sum -c -
+          tar xzf "$tgz" gitleaks && sudo mv gitleaks /usr/local/bin/
+      - name: Scan pushed commits
+        id: scan
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          FORCED: ${{ github.event.forced }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && [ "$FORCED" != "true" ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$AFTER"
+          elif [ "$BRANCH" != "$DEFAULT" ] && git rev-parse -q --verify "origin/$DEFAULT" >/dev/null; then
+            range="$AFTER --not origin/$DEFAULT"
+          else
+            range="$AFTER -n 50"
+          fi
+          echo "Scanning: $range"
+          set +e
+          gitleaks git --redact --no-banner --exit-code 2 --report-format json --report-path leaks.json --log-opts="$range" .
+          code=$?
+          set -e
+          if [ "$code" = "2" ]; then echo "found=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" != "0" ]; then echo "gitleaks failed ($code)"; exit "$code"; fi
+      - name: Open urgent issue
+        if: steps.scan.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSIGNEE: ${{ github.repository_owner }}
+          BRANCH: ${{ github.ref_name }}
+          PUSHER: ${{ github.event.pusher.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create urgent --color B60205 --description "Beyonder urgent alert" 2>/dev/null || true
+          # Rule, file, line and commit only. Secret values are redacted and never written here.
+          findings=$(jq -r '.[] | "- `\(.RuleID)` in `\(.File)` line \(.StartLine), commit `\(.Commit[0:7])`"' leaks.json | sort -u | head -30)
+          title="🔴 Possible secret pushed to ${BRANCH}"
+          body=$(printf '%s\n' \
+            "**gitleaks found possible secrets** in commits pushed to \`${BRANCH}\` by \`${PUSHER}\`:" "" \
+            "$findings" "" \
+            "**Rotate the key first** (removing the commit does not un-leak it), then clean the history." \
+            "Run: ${RUN_URL}" "" \
+            "— Beyonder urgent alert (GitHub Actions, no AI)")
+          existing=$(gh issue list --label urgent --state open --search "in:title \"${title}\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then gh issue comment "$existing" --body "$body"
+          else gh issue create --title "$title" --label urgent --assignee "$ASSIGNEE" --body "$body"; fi
+
+  failing-main:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open urgent issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSIGNEE: ${{ github.repository_owner }}
+          WF: ${{ github.event.workflow_run.name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          gh label create urgent --color B60205 --description "Beyonder urgent alert" 2>/dev/null || true
+          title="🔴 ${WF} failing on ${BRANCH}"
+          body=$(printf '%s\n' \
+            "**${WF}** ended \`${CONCLUSION}\` on \`${BRANCH}\` at \`${SHA:0:7}\`." "" \
+            "Run: ${URL}" "" \
+            "— Beyonder urgent alert (GitHub Actions, no AI)")
+          existing=$(gh issue list --label urgent --state open --search "in:title \"${title}\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then gh issue comment "$existing" --body "$body"
+          else gh issue create --title "$title" --label urgent --assignee "$ASSIGNEE" --body "$body"; fi
